@@ -1,12 +1,15 @@
 {
   "name": "chatroom",
   "version": "1.0.0",
-  "description": "Real-time chatroom with WebSocket",
+  "description": "Real-time chatroom with WebSocket - Go Goroutines/Channels architecture in Node.js",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js"
   },
+  "keywords": ["chatroom", "websocket", "real-time", "chat"],
+  "author": "",
+  "license": "MIT",
   "dependencies": {
     "express": "^4.18.2",
     "ws": "^8.14.2",
