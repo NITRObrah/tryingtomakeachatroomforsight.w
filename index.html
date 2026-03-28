@@ -297,6 +297,7 @@
         .send-btn:disabled {
             opacity: 0.5;
             cursor: not-allowed;
+            transform: none;
         }
 
         /* Login Modal */
@@ -369,6 +370,21 @@
 
         .modal button:hover {
             background: var(--primary-hover);
+        }
+
+        /* Debug Panel */
+        .debug-panel {
+            background: var(--bg-tertiary);
+            padding: 0.5rem 1rem;
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            border-top: 1px solid var(--border-color);
+            display: flex;
+            gap: 1rem;
+        }
+
+        .debug-panel span {
+            font-family: monospace;
         }
 
         /* Scrollbar */
@@ -450,16 +466,30 @@
                     </button>
                 </div>
             </div>
+
+            <!-- Debug Panel -->
+            <div class="debug-panel">
+                <span>Nickname: <strong id="debugNickname">-</strong></span>
+                <span>Messages: <strong id="debugMsgCount">0</strong></span>
+                <span>Status: <strong id="debugStatus">Not connected</strong></span>
+            </div>
         </main>
     </div>
 
     <script>
-        // Global variables
+        // ============================================
+        // Global State
+        // ============================================
         let ws = null;
         let nickname = '';
         let users = [];
+        let msgCount = 0;
+        let reconnectAttempts = 0;
+        const MAX_RECONNECT = 5;
 
-        // DOM elements
+        // ============================================
+        // DOM Elements
+        // ============================================
         const loginModal = document.getElementById('loginModal');
         const nicknameInput = document.getElementById('nicknameInput');
         const statusDot = document.getElementById('statusDot');
@@ -469,26 +499,41 @@
         const sendBtn = document.getElementById('sendBtn');
         const userList = document.getElementById('userList');
         const userCount = document.getElementById('userCount');
+        const debugNickname = document.getElementById('debugNickname');
+        const debugMsgCount = document.getElementById('debugMsgCount');
+        const debugStatus = document.getElementById('debugStatus');
 
+        // ============================================
+        // Event Listeners
+        // ============================================
+        
+        // Handle Enter key in nickname input
         nicknameInput.addEventListener('keypress', (e) => {
             if (e.key === 'Enter') {
                 joinChat();
             }
         });
 
+        // Handle Enter key in message input
         messageInput.addEventListener('keypress', (e) => {
             if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
                 sendMessage();
             }
         });
+
+        // ============================================
+        // Core Functions
+        // ============================================
 
         // Join chat with nickname
         function joinChat() {
             nickname = nicknameInput.value.trim();
             if (!nickname) {
-                nickname = 'Anonymous_' + Math.random().toString(36).substring(2, 6);
+                nickname = 'User_' + Math.random().toString(36).substring(2, 6);
             }
 
+            debugNickname.textContent = nickname;
             loginModal.classList.add('hidden');
             connectWebSocket();
         }
@@ -498,58 +543,77 @@
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
             const wsUrl = `${protocol}//${window.location.host}/ws?nickname=${encodeURIComponent(nickname)}`;
             
-            ws = new WebSocket(wsUrl);
+            log(`Connecting to ${wsUrl}...`);
+            debugStatus.textContent = 'Connecting...';
 
-            ws.onopen = () => {
-                console.log('WebSocket connected');
-                updateConnectionStatus(true);
-                messageInput.disabled = false;
-                sendBtn.disabled = false;
-                messageInput.focus();
-            };
+            try {
+                ws = new WebSocket(wsUrl);
 
-            ws.onmessage = (event) => {
-                try {
-                    const data = JSON.parse(event.data);
-                    handleMessage(data);
-                } catch (e) {
-                    // Handle multiple messages (batched)
-                    const lines = event.data.split('\n');
-                    lines.forEach(line => {
-                        if (line.trim()) {
-                            try {
-                                const msg = JSON.parse(line);
-                                handleMessage(msg);
-                            } catch (err) {
-                                console.error('Parse error:', err);
+                ws.onopen = () => {
+                    log('✅ WebSocket connected!');
+                    updateConnectionStatus(true);
+                    messageInput.disabled = false;
+                    sendBtn.disabled = false;
+                    messageInput.focus();
+                    reconnectAttempts = 0;
+                    debugStatus.textContent = 'Connected';
+                };
+
+                ws.onmessage = (event) => {
+                    log('📨 Received:', event.data);
+                    
+                    try {
+                        const data = JSON.parse(event.data);
+                        handleMessage(data);
+                    } catch (e) {
+                        log('❌ Parse error:', e);
+                        // Try to handle as multiple messages
+                        const lines = event.data.split('\n');
+                        lines.forEach(line => {
+                            if (line.trim()) {
+                                try {
+                                    const msg = JSON.parse(line);
+                                    handleMessage(msg);
+                                } catch (err) {}
                             }
-                        }
-                    });
-                }
-            };
-
-            ws.onclose = () => {
-                console.log('WebSocket disconnected');
-                updateConnectionStatus(false);
-                messageInput.disabled = true;
-                sendBtn.disabled = true;
-                
-       
-                setTimeout(() => {
-                    if (!ws || ws.readyState === WebSocket.CLOSED) {
-                        connectWebSocket();
+                        });
                     }
-                }, 3000);
-            };
+                };
 
-            ws.onerror = (error) => {
-                console.error('WebSocket error:', error);
-                updateConnectionStatus(false);
-            };
+                ws.onclose = (event) => {
+                    log('🔌 WebSocket closed. Code:', event.code, 'Reason:', event.reason);
+                    updateConnectionStatus(false);
+                    messageInput.disabled = true;
+                    sendBtn.disabled = true;
+                    debugStatus.textContent = `Disconnected (${event.code})`;
+
+                    // Try to reconnect
+                    if (reconnectAttempts < MAX_RECONNECT) {
+                        reconnectAttempts++;
+                        log(`Reconnecting in 2s... (attempt ${reconnectAttempts}/${MAX_RECONNECT})`);
+                        debugStatus.textContent = `Reconnecting (${reconnectAttempts}/${MAX_RECONNECT})...`;
+                        setTimeout(connectWebSocket, 2000);
+                    } else {
+                        addSystemMessage('Connection lost. Please refresh the page.', 'leave');
+                        debugStatus.textContent = 'Connection failed';
+                    }
+                };
+
+                ws.onerror = (error) => {
+                    log('❌ WebSocket error:', error);
+                    debugStatus.textContent = 'Error!';
+                };
+
+            } catch (err) {
+                log('❌ Failed to create WebSocket:', err);
+                debugStatus.textContent = 'Failed to connect';
+            }
         }
 
-
+        // Handle incoming messages
         function handleMessage(data) {
+            log('Handling message type:', data.type);
+            
             switch (data.type) {
                 case 'chat':
                     addChatMessage(data);
@@ -563,12 +627,50 @@
                 case 'user_list':
                     updateUserList(data.users);
                     break;
+                case 'system':
+                    addSystemMessage(data.content, '');
+                    break;
                 default:
-                    console.log('Unknown message type:', data.type);
+                    log('Unknown message type:', data.type);
             }
         }
 
- 
+        // Send message
+        function sendMessage() {
+            const content = messageInput.value.trim();
+            
+            log('sendMessage called. Content:', content);
+            log('WebSocket state:', ws ? ws.readyState : 'null');
+            
+            if (!content) {
+                log('Empty message, not sending');
+                return;
+            }
+            
+            if (!ws) {
+                log('No WebSocket connection!');
+                addSystemMessage('Not connected to server!', 'leave');
+                return;
+            }
+            
+            if (ws.readyState !== WebSocket.OPEN) {
+                log('WebSocket not open! State:', ws.readyState);
+                addSystemMessage('Connection not ready. Please wait...', 'leave');
+                return;
+            }
+
+            try {
+                ws.send(content);
+                messageInput.value = '';
+                messageInput.focus();
+                log('✅ Message sent successfully');
+            } catch (err) {
+                log('❌ Failed to send message:', err);
+                addSystemMessage('Failed to send message!', 'leave');
+            }
+        }
+
+        // Add chat message to the container
         function addChatMessage(data) {
             const messageDiv = document.createElement('div');
             const isSent = data.nickname === nickname;
@@ -590,9 +692,12 @@
 
             messagesContainer.appendChild(messageDiv);
             scrollToBottom();
+            
+            msgCount++;
+            debugMsgCount.textContent = msgCount;
         }
 
-   
+        // Add system message (join/leave)
         function addSystemMessage(content, type = '') {
             const messageDiv = document.createElement('div');
             messageDiv.className = `message system ${type}`;
@@ -601,7 +706,7 @@
             scrollToBottom();
         }
 
-
+        // Update user list
         function updateUserList(userListData) {
             users = userListData || [];
             userCount.textContent = users.length;
@@ -617,21 +722,11 @@
                     </div>
                 `;
             }).join('');
+            
+            log('User list updated:', users.length, 'users');
         }
 
-       
-        function sendMessage() {
-            const content = messageInput.value.trim();
-            if (!content || !ws || ws.readyState !== WebSocket.OPEN) {
-                return;
-            }
-
-            ws.send(content);
-            messageInput.value = '';
-            messageInput.focus();
-        }
-
-  
+        // Update connection status
         function updateConnectionStatus(connected) {
             if (connected) {
                 statusDot.classList.add('connected');
@@ -642,17 +737,27 @@
             }
         }
 
-     
+        // Scroll to bottom of messages
         function scrollToBottom() {
             messagesContainer.scrollTop = messagesContainer.scrollHeight;
         }
 
-    
+        // Escape HTML to prevent XSS
         function escapeHtml(text) {
             const div = document.createElement('div');
             div.textContent = text;
             return div.innerHTML;
         }
+
+        // Debug logging
+        function log(...args) {
+            console.log('[Chat]', new Date().toLocaleTimeString(), ...args);
+        }
+
+        // ============================================
+        // Initialize
+        // ============================================
+        log('Page loaded, waiting for nickname input...');
     </script>
 </body>
 </html>
