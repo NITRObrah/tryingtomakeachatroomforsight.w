@@ -1,10 +1,13 @@
-
+/**
+ * Real-Time Chatroom Server - Fixed Version
+ * 
+ * Architecture: [Browser] <--> [WebSocket] <--> [Node.js Server] <--> [Redis/Memory]
+ */
 
 const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
 const path = require('path');
-const Redis = require('ioredis');
 
 // ============================================
 // Message Types
@@ -13,18 +16,12 @@ const MessageType = {
   CHAT: 'chat',
   JOIN: 'join',
   LEAVE: 'leave',
-  USER_LIST: 'user_list',
-  SYSTEM: 'system'
+  USER_LIST: 'user_list'
 };
 
 // ============================================
-// Storage Interface (Memory & Redis)
+// In-Memory Storage
 // ============================================
-
-/**
- * In-Memory Storage Implementation
- * Similar to Go's MemoryStore struct
- */
 class MemoryStore {
   constructor(maxMessages = 100) {
     this.messages = [];
@@ -32,315 +29,159 @@ class MemoryStore {
     this.maxMessages = maxMessages;
   }
 
-  async saveMessage(msg) {
+  saveMessage(msg) {
     this.messages.push(msg);
     if (this.messages.length > this.maxMessages) {
       this.messages = this.messages.slice(-this.maxMessages);
     }
   }
 
-  async getRecentMessages(limit = 50) {
-    if (limit <= 0 || limit > this.messages.length) {
-      return [...this.messages];
-    }
+  getRecentMessages(limit = 50) {
     return this.messages.slice(-limit);
   }
 
-  async addUser(nickname) {
+  addUser(nickname) {
     this.users.add(nickname);
   }
 
-  async removeUser(nickname) {
+  removeUser(nickname) {
     this.users.delete(nickname);
   }
 
-  async getUsers() {
+  getUsers() {
     return Array.from(this.users);
   }
 }
 
-/**
- * Redis Storage Implementation
- * Similar to Go's RedisStore struct
- */
-class RedisStore {
-  constructor(redisClient, maxMessages = 100) {
-    this.client = redisClient;
-    this.msgKey = 'chatroom:messages';
-    this.userSetKey = 'chatroom:users';
-    this.maxMessages = maxMessages;
-  }
-
-  async saveMessage(msg) {
-    const data = JSON.stringify(msg);
-    await this.client.rpush(this.msgKey, data);
-    await this.client.ltrim(this.msgKey, -this.maxMessages, -1);
-  }
-
-  async getRecentMessages(limit = 50) {
-    const results = await this.client.lrange(this.msgKey, -limit, -1);
-    return results.map(data => {
-      try {
-        return JSON.parse(data);
-      } catch {
-        return null;
-      }
-    }).filter(Boolean);
-  }
-
-  async addUser(nickname) {
-    await this.client.sadd(this.userSetKey, nickname);
-  }
-
-  async removeUser(nickname) {
-    await this.client.srem(this.userSetKey, nickname);
-  }
-
-  async getUsers() {
-    return await this.client.smembers(this.userSetKey);
-  }
-}
-
 // ============================================
-// ChatRoom - Core Logic (Like Go's ChatRoom struct)
+// ChatRoom - Core Logic
 // ============================================
-
-/**
- * ChatRoom manages all clients and message broadcasting
- * Uses channel-like patterns with EventEmitter
- */
 class ChatRoom {
   constructor(store) {
-    this.clients = new Map(); // Map<nickname, Client>
+    this.clients = new Map(); // nickname -> { ws, nickname }
     this.store = store;
-    
-    // "Channels" for message passing (like Go channels)
-    this.registerQueue = [];
-    this.unregisterQueue = [];
-    this.broadcastQueue = [];
-    
-    // Start the event loop (like Go's Run() goroutine)
-    this.runEventLoop();
+    console.log('✅ ChatRoom initialized');
   }
 
-  /**
-   * Main event loop - similar to Go's select statement
-   * Processes register, unregister, and broadcast "channels"
-   */
-  async runEventLoop() {
-    setInterval(() => {
-      // Process registration queue
-      while (this.registerQueue.length > 0) {
-        const client = this.registerQueue.shift();
-        this.handleRegister(client);
-      }
+  // Register a new client
+  register(nickname, ws) {
+    // Handle duplicate nicknames
+    let finalNickname = nickname;
+    let counter = 1;
+    while (this.clients.has(finalNickname)) {
+      finalNickname = `${nickname}_${counter}`;
+      counter++;
+    }
 
-      // Process unregistration queue
-      while (this.unregisterQueue.length > 0) {
-        const client = this.unregisterQueue.shift();
-        this.handleUnregister(client);
-      }
+    this.clients.set(finalNickname, { ws, nickname: finalNickname });
+    this.store.addUser(finalNickname);
 
-      // Process broadcast queue
-      while (this.broadcastQueue.length > 0) {
-        const message = this.broadcastQueue.shift();
-        this.handleBroadcast(message);
-      }
-    }, 10); // Process every 10ms
-  }
-
-  /**
-   * Register a new client (like Go: cr.register <- client)
-   */
-  register(client) {
-    this.registerQueue.push(client);
-  }
-
-  /**
-   * Unregister a client (like Go: cr.unregister <- client)
-   */
-  unregister(client) {
-    this.unregisterQueue.push(client);
-  }
-
-  /**
-   * Broadcast a message (like Go: cr.broadcast <- message)
-   */
-  broadcast(message) {
-    this.broadcastQueue.push(message);
-  }
-
-  /**
-   * Handle client registration
-   */
-  async handleRegister(client) {
-    this.clients.set(client.nickname, client);
-    await this.store.addUser(client.nickname);
+    console.log(`📥 Client registered: ${finalNickname} (Total: ${this.clients.size})`);
 
     // Send message history to new client
-    await this.sendHistory(client);
+    this.sendHistory(ws);
 
     // Broadcast join message
-    const joinMsg = {
+    this.broadcast({
       type: MessageType.JOIN,
-      nickname: client.nickname,
+      nickname: finalNickname,
       content: 'joined the chat! 🎉',
       timestamp: new Date().toISOString()
-    };
-    this.broadcast(joinMsg);
+    });
 
-    // Update user list for all clients
+    // Update user list
     this.broadcastUserList();
 
-    console.log(`Client connected: ${client.nickname} (Total: ${this.clients.size})`);
+    return finalNickname;
   }
 
-  /**
-   * Handle client disconnection
-   */
-  async handleUnregister(client) {
-    if (this.clients.has(client.nickname)) {
-      this.clients.delete(client.nickname);
-      await this.store.removeUser(client.nickname);
+  // Unregister a client
+  unregister(nickname) {
+    if (this.clients.has(nickname)) {
+      this.clients.delete(nickname);
+      this.store.removeUser(nickname);
+
+      console.log(`📤 Client left: ${nickname} (Total: ${this.clients.size})`);
 
       // Broadcast leave message
-      const leaveMsg = {
+      this.broadcast({
         type: MessageType.LEAVE,
-        nickname: client.nickname,
+        nickname: nickname,
         content: 'left the chat. 👋',
         timestamp: new Date().toISOString()
-      };
-      this.broadcast(leaveMsg);
+      });
 
       // Update user list
       this.broadcastUserList();
-
-      console.log(`Client disconnected: ${client.nickname} (Total: ${this.clients.size})`);
     }
   }
 
-  /**
-   * Handle message broadcasting
-   */
-  async handleBroadcast(message) {
-    // Save message to store
-    await this.store.saveMessage(message);
+  // Handle incoming chat message
+  handleChatMessage(nickname, content) {
+    const msg = {
+      type: MessageType.CHAT,
+      nickname: nickname,
+      content: content,
+      timestamp: new Date().toISOString()
+    };
 
-    // Send to all clients
+    // Save to store
+    this.store.saveMessage(msg);
+
+    // Broadcast to all clients
+    this.broadcast(msg);
+
+    console.log(`💬 ${nickname}: ${content}`);
+  }
+
+  // Broadcast message to all clients
+  broadcast(message) {
     const data = JSON.stringify(message);
+    let sent = 0;
+
     for (const [nickname, client] of this.clients) {
       try {
-        client.send(data);
+        if (client.ws.readyState === WebSocket.OPEN) {
+          client.ws.send(data);
+          sent++;
+        }
       } catch (err) {
-        console.error(`Error sending to ${nickname}:`, err.message);
+        console.error(`❌ Error sending to ${nickname}:`, err.message);
       }
     }
+
+    console.log(`   ↗️  Broadcast to ${sent} clients`);
   }
 
-  /**
-   * Send message history to a client
-   */
-  async sendHistory(client) {
-    const messages = await this.store.getRecentMessages(50);
+  // Send message history to a client
+  sendHistory(ws) {
+    const messages = this.store.getRecentMessages(50);
     for (const msg of messages) {
       try {
-        client.send(JSON.stringify(msg));
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify(msg));
+        }
       } catch (err) {
         break;
       }
     }
   }
 
-  /**
-   * Broadcast user list to all clients
-   */
-  async broadcastUserList() {
-    const users = await this.store.getUsers();
+  // Broadcast user list to all clients
+  broadcastUserList() {
+    const users = this.store.getUsers();
     const msg = {
       type: MessageType.USER_LIST,
       users: users,
       timestamp: new Date().toISOString()
     };
-    const data = JSON.stringify(msg);
-
-    for (const client of this.clients.values()) {
-      try {
-        client.send(data);
-      } catch (err) {
-        // Ignore errors
-      }
-    }
-  }
-
-  /**
-   * Handle WebSocket connection
-   */
-  handleConnection(ws, req) {
-    const url = new URL(req.url, `http://${req.headers.host}`);
-    let nickname = url.searchParams.get('nickname') || `Anonymous_${generateID()}`;
-
-    // Ensure unique nickname
-    if (this.clients.has(nickname)) {
-      nickname = `${nickname}_${generateID()}`;
-    }
-
-    // Create client object
-    const client = {
-      ws: ws,
-      nickname: nickname,
-      send: (data) => {
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(data);
-        }
-      }
-    };
-
-    // Register client
-    this.register(client);
-
-    // Handle incoming messages (like Go's readPump goroutine)
-    ws.on('message', (data) => {
-      try {
-        const content = data.toString();
-        if (content.trim()) {
-          const msg = {
-            type: MessageType.CHAT,
-            nickname: client.nickname,
-            content: content,
-            timestamp: new Date().toISOString()
-          };
-          this.broadcast(msg);
-        }
-      } catch (err) {
-        console.error('Message handling error:', err);
-      }
-    });
-
-    // Handle disconnection
-    ws.on('close', () => {
-      this.unregister(client);
-    });
-
-    ws.on('error', (err) => {
-      console.error('WebSocket error:', err);
-      this.unregister(client);
-    });
-
-    // Send ping to keep connection alive (like Go's writePump ticker)
-    const pingInterval = setInterval(() => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.ping();
-      } else {
-        clearInterval(pingInterval);
-      }
-    }, 30000);
+    this.broadcast(msg);
   }
 }
 
 // ============================================
 // Utility Functions
 // ============================================
-
 function generateID() {
   return Math.random().toString(36).substring(2, 6);
 }
@@ -348,26 +189,9 @@ function generateID() {
 // ============================================
 // Main Application
 // ============================================
-
-async function main() {
-  // Initialize storage (try Redis first, fallback to memory)
-  let store;
-  
-  try {
-    const redisClient = new Redis({
-      host: 'localhost',
-      port: 6379,
-      maxRetriesPerRequest: 1,
-      retryStrategy: () => null
-    });
-
-    await redisClient.ping();
-    console.log('✅ Connected to Redis for message storage');
-    store = new RedisStore(redisClient);
-  } catch (err) {
-    console.log('⚠️  Redis not available, using in-memory storage');
-    store = new MemoryStore();
-  }
+function main() {
+  // Create store
+  const store = new MemoryStore(100);
 
   // Create chatroom
   const chatRoom = new ChatRoom(store);
@@ -379,36 +203,93 @@ async function main() {
   // Serve static files
   app.use(express.static(path.join(__dirname, 'static')));
 
-  // Serve index.html at root
-  app.get('/', (req, res) => {
-    res.sendFile(path.join(__dirname, 'static', 'index.html'));
-  });
-
   // API endpoints
-  app.get('/api/users', async (req, res) => {
-    const users = await store.getUsers();
-    res.json({ users });
+  app.get('/api/users', (req, res) => {
+    res.json({ users: store.getUsers() });
   });
 
-  app.get('/api/messages', async (req, res) => {
-    const messages = await store.getRecentMessages(50);
-    res.json({ messages });
+  app.get('/api/messages', (req, res) => {
+    res.json({ messages: store.getRecentMessages(50) });
   });
 
   // Setup WebSocket server
   const wss = new WebSocket.Server({ server });
 
   wss.on('connection', (ws, req) => {
-    chatRoom.handleConnection(ws, req);
+    // Get nickname from URL query params
+    const urlObj = new URL(req.url, `http://${req.headers.host}`);
+    let nickname = urlObj.searchParams.get('nickname') || `Anonymous_${generateID()}`;
+
+    console.log(`\n🔌 New WebSocket connection from ${req.socket.remoteAddress}`);
+    console.log(`   Nickname: ${nickname}`);
+
+    // Register client
+    const finalNickname = chatRoom.register(nickname, ws);
+
+    // Send welcome message
+    ws.send(JSON.stringify({
+      type: 'system',
+      content: `Welcome to the chat, ${finalNickname}!`,
+      timestamp: new Date().toISOString()
+    }));
+
+    // Handle incoming messages
+    ws.on('message', (data) => {
+      try {
+        const content = data.toString().trim();
+        if (content) {
+          chatRoom.handleChatMessage(finalNickname, content);
+        }
+      } catch (err) {
+        console.error('❌ Message handling error:', err);
+      }
+    });
+
+    // Handle disconnection
+    ws.on('close', () => {
+      console.log(`🔌 Connection closed: ${finalNickname}`);
+      chatRoom.unregister(finalNickname);
+    });
+
+    // Handle errors
+    ws.on('error', (err) => {
+      console.error(`❌ WebSocket error for ${finalNickname}:`, err.message);
+      chatRoom.unregister(finalNickname);
+    });
+
+    // Keep connection alive with ping/pong
+    ws.isAlive = true;
+    ws.on('pong', () => {
+      ws.isAlive = true;
+    });
+  });
+
+  // Ping all clients every 30 seconds
+  const pingInterval = setInterval(() => {
+    wss.clients.forEach((ws) => {
+      if (ws.isAlive === false) {
+        return ws.terminate();
+      }
+      ws.isAlive = false;
+      ws.ping();
+    });
+  }, 30000);
+
+  wss.on('close', () => {
+    clearInterval(pingInterval);
   });
 
   // Start server
   const PORT = process.env.PORT || 8080;
   server.listen(PORT, () => {
-    console.log(`🚀 Chatroom server running on http://localhost:${PORT}`);
-    console.log('📡 WebSocket endpoint: ws://localhost:' + PORT + '/ws');
+    console.log('\n=================================');
+    console.log('🚀 Chatroom Server Started!');
+    console.log('=================================');
+    console.log(`📡 HTTP:      http://localhost:${PORT}`);
+    console.log(`📡 WebSocket: ws://localhost:${PORT}/ws?nickname=YourName`);
+    console.log('=================================\n');
   });
 }
 
 // Run the application
-main().catch(console.error);
+main();
